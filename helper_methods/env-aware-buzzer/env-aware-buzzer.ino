@@ -1,25 +1,36 @@
 #define BUZZER_PIN 5
 int sound_sensor = A1;
 
-const int buzzerChannel = 0;    // LEDC channel
 const int buzzerResol = 8;      // 8-bit resolution
 
-// Songs
-int songOneMelody[] = {523, 587, 659, 784, 784, 659, 587, 523, 659, 698, 784, 1047, 988, 784, 659, 587};
-int songOneDurations[] = {300, 300, 300, 400, 400, 300, 300, 500, 300, 300, 300, 400, 400, 300, 300, 500};
+// --- Happy Birthday Melody ---
+int songMelody[] = {
+  264, 264, 297, 264, 352, 330,  // Happy Birthday to You
+  264, 264, 297, 264, 396, 352,  // Happy Birthday to You
+  264, 264, 528, 440, 352, 330, 297, // Happy Birthday Dear [Name]
+  466, 466, 440, 352, 396, 352   // Happy Birthday to You
+};
+
+// Note durations (ms)
+int songDurations[] = {
+  250, 125, 500, 500, 500, 1000,
+  250, 125, 500, 500, 500, 1000,
+  250, 125, 500, 500, 500, 500, 1000,
+  250, 125, 500, 500, 500, 1000
+};
 
 // --- Calibration ---
-int baseline = 0;              // ambient noise
-const int CALIBRATION_TIME = 3000; // ms
-const int SAMPLE_COUNT = 32;       // samples for averaging
+int baseline = 0;              
+const int CALIBRATION_TIME = 3000; 
+const int SAMPLE_COUNT = 32;       
 
 // Volume mapping
-const int MIN_DUTY = 50;       // quiet buzzer
-const int MAX_DUTY = 255;      // loud buzzer
+const int MIN_DUTY = 50;       
+const int MAX_DUTY = 255;      
 
 void setup() {
   Serial.begin(115200);
-  ledcAttach(BUZZER_PIN, 1000, buzzerResol); // initial freq 1kHz, resolution 8-bit
+  ledcAttach(BUZZER_PIN, 1000, buzzerResol);
   ledcWrite(BUZZER_PIN, 0);
 
   // --- Calibrate ambient noise ---
@@ -42,11 +53,11 @@ void setup() {
 
 // --- Play music with dynamic volume ---
 void playMusic() {
-  int songLength = sizeof(songOneMelody) / sizeof(songOneMelody[0]);
+  int songLength = sizeof(songMelody) / sizeof(songMelody[0]);
 
   for (int i = 0; i < songLength; i++) {
-    int freq = songOneMelody[i];
-    int duration = songOneDurations[i];
+    int freq = songMelody[i];
+    int duration = songDurations[i];
 
     unsigned long startTime = millis();
     while (millis() - startTime < duration) {
@@ -64,6 +75,7 @@ void playMusic() {
       ledcChangeFrequency(BUZZER_PIN, freq, buzzerResol);
 
       // --- Print values for Serial Plotter ---
+      Serial.print("Min:0 Max:1023 "); // keep min/max for plotter
       Serial.print("Sound:");
       Serial.print(soundValue);
       Serial.print("\tDuty:");
