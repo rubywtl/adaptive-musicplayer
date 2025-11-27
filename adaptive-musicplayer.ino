@@ -1,34 +1,48 @@
-// ------------------------------------------------------------------
+// ==================================================================
 // INCLUDES
-// ------------------------------------------------------------------
+// ==================================================================
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
-// ------------------------------------------------------------------
+// ==================================================================
 // MACROS
-// ------------------------------------------------------------------
+// ==================================================================
 #define BUZZER_PIN 5
-#define SOUND_SENSOR A1
-#define SDA 16
-#define SCL 17
+#define SOUND_SENSOR 1
+#define SDA 8
+#define SCL 9
 
-// ----------------------------------------------------------------------
-// Global Variables and Data Structures
-// ----------------------------------------------------------------------
-// mode
-enum Mode { AUTO_MODE, MANUAL_MODE };
-Mode mode = AUTO_MODE; // default to auto mode
+// ==================================================================
+// GLOBAL VARIABLES
+// ==================================================================
 
-// buzzer setup
+// --- Buzzer Configuration ---
 const int buzzerChannel = 0;
-const int buzzerResol   = 8; 
+const int buzzerResol = 8;
 
-// calibration
-const int SAMPLE_COUNT = 32;
+// --- Calibration & Volume Mapping ---
+int baseline = 0;               
+const int CALIBRATION_TIME = 3000; 
+const int SAMPLE_COUNT = 32;       
+const int MIN_DUTY = 50;       
+const int MAX_DUTY = 255;      
+const float PITCH_SCALE = 1.0;
+float currentDuty = MAX_DUTY;
+const float DUTY_ALPHA = 0.1f;
 
-// Song struct
+// --- Mode ---
+enum Mode { AUTO_MODE, MANUAL_MODE };
+Mode mode = AUTO_MODE;
+
+// --- Shared State (Mutex Protected) ---
+volatile int volume = MAX_DUTY;
+SemaphoreHandle_t volumeMutex;
+volatile int currentsong = 0;
+
+// --- Song Data Structure ---
 struct Song {
     const char* name;
     int* melody;
@@ -36,278 +50,256 @@ struct Song {
     int length;
 };
 
-// HAPPY BIRTHDAY
-int HBDMelody[] = {
-  264, 264, 297, 264, 352, 330,
-  264, 264, 297, 264, 396, 352,
-  264, 264, 528, 440, 352, 330, 297,
-  466, 466, 440, 352, 396, 352
+// --- Song Arrays ---
+int HBDMelody[] = {264,264,297,264,352,330,264,264,297,264,396,352,264,264,528,440,352,330,297,466,466,440,352,396,352};
+int HBDDurations[] = {250,125,500,500,500,1000,250,125,500,500,500,1000,250,125,500,500,500,500,1000,250,125,500,500,500,1000};
+
+int jingleMelody[] = {330,330,330, 330,330,330, 330,392,262,294,330, 349,349,349,349,349,330,330,330,330,294,294,330,294,392};
+int jingleDurations[] = {250,250,500, 250,250,500, 250,250,250,250,500, 250,250,375,125,500, 250,250,375,125,250,250,250,250,750};
+
+int merryMelody[] = {392,392,440,392,523,494, 392,392,440,392,587,523, 392,392,784,659,523,494,440, 698,698,659,523,587,523};
+int merryDurations[] = {300,300,300,300,300,600, 300,300,300,300,300,600, 300,300,300,300,300,300,600, 300,300,300,300,300,600};
+
+int silentMelody[] = {392,392,440,392,494,466, 392,392,440,392,523,494, 392,392,784,659,523,494,440, 698,698,659,523,587,523};
+int silentDurations[] = {600,600,700,700,700,700, 600,600,700,700,700,700, 600,600,700,700,700,700,900, 700,700,700,700,700,900};
+
+const int TOTAL_SONGS = 4;
+const Song songs[TOTAL_SONGS] = {
+    {"Happy Birthday", HBDMelody, HBDDurations, sizeof(HBDMelody)/sizeof(int)},
+    {"Jingle Bells", jingleMelody, jingleDurations, sizeof(jingleMelody)/sizeof(int)},
+    {"Merry Xmas", merryMelody, merryDurations, sizeof(merryMelody)/sizeof(int)},
+    {"Silent Night", silentMelody, silentDurations, sizeof(silentMelody)/sizeof(int)}
 };
 
-int HBDDurations[] = {
-  250,125,500,500,500,1000,
-  250,125,500,500,500,1000,
-  250,125,500,500,500,500,1000,
-  250,125,500,500,500,1000
-};
-
-// JINGLE BELLS
-int jingleMelody[] = {
-  330,330,330, 330,330,330, 330,392,262,294,330,
-  349,349,349,349,349,330,330,330,330,294,294,330,294,392
-};
-
-int jingleDurations[] = {
-  250,250,500, 250,250,500, 250,250,250,250,500,
-  250,250,375,125,500, 250,250,375,125,250,250,250,250,750
-};
-
-// WE WISH YOU A MERRY CHRISTMAS
-int merryMelody[] = {
-  392,392,440,392,523,494,
-  392,392,440,392,587,523,
-  392,392,784,659,523,494,440,
-  698,698,659,523,587,523
-};
-
-int merryDurations[] = {
-  300,300,300,300,300,600,
-  300,300,300,300,300,600,
-  300,300,300,300,300,300,600,
-  300,300,300,300,300,600
-};
-
-// SILENT NIGHT
-int silentMelody[] = {
-  392,392,440,392,494,466,
-  392,392,440,392,523,494,
-  392,392,784,659,523,494,440,
-  698,698,659,523,587,523
-};
-
-int silentDurations[] = {
-  600,600,700,700,700,700,
-  600,600,700,700,700,700,
-  600,600,700,700,700,700,900,
-  700,700,700,700,700,900
-};
-
-const Song songs[] = {
-    { "Happy Birthday", HBDMelody, HBDDurations, sizeof(HBDMelody)/4 },
-    { "Jingle Bells", jingleMelody, jingleDurations, sizeof(jingleMelody)/4 },
-    { "Merry Xmas", merryMelody, merryDurations, sizeof(merryMelody)/4 },
-    { "Silent Night", silentMelody, silentDurations, sizeof(silentMelody)/4 }
-};
-
-
-// Current state variables
-volatile int volume;           // volume level (0-255)
-SemaphoreHandle_t volumeMutex;
-volatile int currentsong = 0; // current song index
-
-
-// ----------------------------------------------------------------------
-// Interrupts
-// ----------------------------------------------------------------------
-
-// TODO: REMOTE CONTROL 
-    // a. Control Songs
-    // b. Adjust Volume
-    // c. Pause
-void receivedRemoteSignal(){
-    // adjust volume
-    int volume = 5;
-    changeVolume(volume);
-
-
-    // adjust songs - map buttons
-    // if click right -> go to next song
-    nextSongHelper();
-    // if click left -> go to the prev song
-    prevSongHelper();
-
-    // pause - map buttons
-    // need a state to keep track of the state of the song
-    // bool paused;
-    // if pressed ok and the state is unpaused->pause
-        // if(paused && button == ok)
-    // if pressed ok and the state is pasued -> unpase
-        // if(!paused && button == ok)
-    
-}
-
-
-// ----------------------------------------------------------------------
-// Tasks
-// ----------------------------------------------------------------------
-
-// ======== DATA COLLECT ========
-
-// FreeRTOS Task to collect data from sound sensor in auto mode
-void collectSoundDataTask(void *pvParameters){
-    // collect data from sound sensor over a period of time
-    // process data to determine appropriate volume level
-    if(mode == AUTO_MODE){
-        while(1){
-            int soundValue = 0;
-            
-            // 1. collect data
-            for (int j = 0; j < SAMPLE_COUNT; j++) soundValue += analogRead(sound_sensor);
-            soundValue >>= 5;
-
-            // 2. change volume if needed
-            //  change if encountered convo
-            // --- Map soundValue to buzzer PWM ---
-            int targetDuty = map(soundValue, baseline, 1023, MIN_DUTY, MAX_DUTY);
-            targetDuty = constrain(targetDuty, MIN_DUTY, MAX_DUTY);
-
-            currentDuty = currentDuty + DUTY_ALPHA * (targetDuty - currentDuty);
-            int dutyToWrite = (int)currentDuty;
-
-            changeVolumeHelper(dutyToWrite);
-        }
-    } 
-    TaskDelay(pdMS_TO_TICKS(100)); // yield 100ms
-}
-
-
-// ======== VOLUME ADJUST ==========
-
-void changeVolumeHelper(int new_volume){
-    // out of bounds check
-    if(new_volume < 0) new_volume = 0;
-    if(new_volume > 255) new_volume = 255;
-    
-    // assign new volume
-    if(xSemaphoreTake(volumeMutex, portMAX_DELAY) == pdTRUE) {
-        volume = new_volume;  // safe write
-        xSemaphoreGive(volumeMutex);  // release mutex
-    }
-}
-
-// ========== SONG HELPER ==========
-// go to the next song
-void nextSongHelper() {
-  currentsong++;
-  if (currentsong >= TOTAL_SONGS)
-    currentsong = 0;
-
-  Serial.print(">> Next Song: ");
-  Serial.println(songs[currentsong].name);
-}
-
-// go back to the previous song
-void prevSongHelper() {
-  currentsong--;
-  if (currentsong < 0)
-    currentsong = TOTAL_SONGS - 1;
-
-  Serial.print("<< Prev Song: ");
-  Serial.println(songs[currentsong].name);
-}
-
-
-// ======== PLAY MUSIC ========
-// Task to play music
-void playMusicTask(void *pvParameters){
-    // play music with volume set to 'volume' variable
-    int songLength = sizeof(songMelody) / sizeof(songMelody[0]);
-
-    for (int i = 0; i < songLength; i++) {
-        int baseFreq = songMelody[i];
-        int freq = (int)(baseFreq * PITCH_SCALE);
-        int duration = songDurations[i];
-
-        unsigned long startTime = millis();
-        while (millis() - startTime < duration) {
-
-        // --- Read sound sensor ---
-        int soundValue = 0;
-        for (int j = 0; j < SAMPLE_COUNT; j++) soundValue += analogRead(sound_sensor);
-        soundValue >>= 5;
-
-        // --- Map soundValue to buzzer PWM ---
-        int targetDuty = map(soundValue, baseline, 1023, MIN_DUTY, MAX_DUTY);
-        targetDuty = constrain(targetDuty, MIN_DUTY, MAX_DUTY);
-
-        // exponential smoothing -> make currentDuty chase targetDuty 
-        // small alpha(smooth)
-        // big alpha (very sensitive)
-        currentDuty = currentDuty + DUTY_ALPHA * (targetDuty - currentDuty);
-        int dutyToWrite = (int)currentDuty;
-
-        ledcWrite(BUZZER_PIN, dutyToWrite);
-        ledcChangeFrequency(BUZZER_PIN, freq, buzzerResol);
-        }
-    }
-}
-
-
-// ======== LCD DISPLAY ========
+// --- LCD Object ---
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-void displayOnLCDTask(void *pvParameters) {
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print(songs[currentsong].name);
+// ==================================================================
+// FUNCTION DECLARATIONS
+// ==================================================================
+void changeVolumeHelper(int new_volume);
+void nextSongHelper();
+void prevSongHelper();
+int calibration();
 
-  lcd.setCursor(0, 1);
-  lcd.print("Volume:");
+// Task Declarations
+void collectSoundDataTask(void *pvParameters);
+void playMusicTask(void *pvParameters);
+void displayOnLCDTask(void *pvParameters);
 
-  int currentVol;
-  if(xSemaphoreTake(volumeMutex, portMAX_DELAY) == pdTRUE){
-    currentVol = volume;  // safe read
-    xSemaphoreGive(volumeMutex);
+// ==================================================================
+// FUNCTION IMPLEMENTATIONS
+// ==================================================================
+
+// --- Volume Control ---
+void changeVolumeHelper(int new_volume){
+    if(new_volume < MIN_DUTY) new_volume = MIN_DUTY;
+    if(new_volume > MAX_DUTY) new_volume = MAX_DUTY;
+
+    if(xSemaphoreTake(volumeMutex, portMAX_DELAY) == pdTRUE){
+        volume = new_volume;
+        xSemaphoreGive(volumeMutex);
     }
-    lcd.print(currentVol);
-
-  lcd.setCursor(10,1);
-  lcd.print(mode == AUTO_MODE ? "AUTO" : "MANUAL");
 }
 
-// ======== Setup and Loop ========
+// --- Song Navigation ---
+void nextSongHelper(){
+    currentsong++;
+    if(currentsong >= TOTAL_SONGS) currentsong = 0;
+    Serial.print(">> Next Song: "); 
+    Serial.println(songs[currentsong].name);
+}
+
+void prevSongHelper(){
+    currentsong--;
+    if(currentsong < 0) currentsong = TOTAL_SONGS - 1;
+    Serial.print("<< Prev Song: "); 
+    Serial.println(songs[currentsong].name);
+}
+
+// --- Calibration ---
 int calibration(){
-  long sum = 0;
-  int count = 0;
-  unsigned long start = millis();
-  while (millis() - start < CALIBRATION_TIME) {
-    int val = 0;
-    for (int i = 0; i < SAMPLE_COUNT; i++) val += analogRead(sound_sensor);
-    val >>= 5;
-    sum += val;
-    count++;
-    delay(10);
-  }
-  baseline = sum / count;
-  return baseline;
+    long sum = 0;
+    int count = 0;
+    unsigned long start = millis();
+    
+    while(millis() - start < CALIBRATION_TIME){
+        int val = 0;
+        for(int i = 0; i < SAMPLE_COUNT; i++){
+            val += analogRead(SOUND_SENSOR);
+        }
+        val /= SAMPLE_COUNT; 
+        sum += val;
+        count++;
+        delay(10);
+    }
+    
+    baseline = sum / count;
+    
+    // sanity check
+    if(baseline >= 4000) baseline = 2000;
+    if(baseline <= 10) baseline = 100; 
+    
+    return baseline;
 }
+
+
+// ==================================================================
+// FREERTOS TASKS
+// ==================================================================
+
+// --- Task: Collect Sound Data (Auto Mode) ---
+void collectSoundDataTask(void *pvParameters){
+    printf("data collection task\n");
+
+    while(1){
+        // only collects sound data in AUTO mode
+        if(mode == AUTO_MODE){
+            int soundValue = 0;
+            
+            // sample sound sensor
+            for(int j = 0; j < SAMPLE_COUNT; j++){
+                soundValue += analogRead(SOUND_SENSOR);
+            }
+            soundValue >>= 5;  // divide by 32
+
+            // map to duty cycle range
+            // - instead of setting duty cycles directly, use smoothing
+            // - this makes volume changes less abrupt
+            int targetDuty = map(soundValue, baseline, 4095, MIN_DUTY, MAX_DUTY);
+            targetDuty = constrain(targetDuty, MIN_DUTY, MAX_DUTY);
+            
+            // smooth transition: currentDuty chases targetDuty
+            currentDuty = currentDuty + DUTY_ALPHA * (targetDuty - currentDuty);
+            
+            Serial.print("Current duty: ");
+            Serial.println((int)currentDuty);
+            
+            // Update volume
+            changeVolumeHelper((int)currentDuty);
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+// --- Task: Play Music ---
+void playMusicTask(void *pvParameters){
+    printf("play music task\n");
+
+    while(1){
+        Song song = songs[currentsong];
+        
+        Serial.print("Playing: ");
+        Serial.println(song.name);
+        
+        // play each note in the song
+        for(int i = 0; i < song.length; i++){
+            int freq = (int)(song.melody[i] * PITCH_SCALE);
+            int dur = song.durations[i];
+            
+            // play note for its duration
+            unsigned long start = millis();
+            while(millis() - start < dur){
+                // read volume safely
+                int vol;
+                if(xSemaphoreTake(volumeMutex, portMAX_DELAY) == pdTRUE){
+                    vol = volume;
+                    xSemaphoreGive(volumeMutex);
+                }
+                
+                // set frequency and volume
+                ledcChangeFrequency(buzzerChannel, freq, buzzerResol);
+                ledcWrite(buzzerChannel, vol);
+                
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            
+            // silence between notes
+            ledcWrite(buzzerChannel, 0);
+            vTaskDelay(pdMS_TO_TICKS(30));
+        }
+        
+        // pause before repeating song
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+// --- Task: Display on LCD ---
+void displayOnLCDTask(void *pvParameters){
+    printf("display task\n");
+
+    while(1){
+        lcd.clear();
+        
+        // Line 1: Song name
+        lcd.setCursor(0, 0);
+        lcd.print(songs[currentsong].name);
+
+        // Line 2: Volume and mode
+        lcd.setCursor(0, 1);
+        lcd.print("Vol:");
+        
+        int currentVol;
+        if(xSemaphoreTake(volumeMutex, portMAX_DELAY) == pdTRUE){
+            currentVol = volume;
+            xSemaphoreGive(volumeMutex);
+        }
+        lcd.print(currentVol);
+
+        lcd.setCursor(10, 1);
+        lcd.print(mode == AUTO_MODE ? "AUTO" : "MANUAL");
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+// ==================================================================
+// SETUP & LOOP
+// ==================================================================
 
 void setup(){
-  Serial.begin(115200);
+    // --- Serial Communication ---
+    Serial.begin(115200);
+    Serial.println("\n=== Music Player Starting ===");
 
-  Wire.begin(SDA, SCL);
+    // --- I2C & LCD ---
+    Wire.begin(SDA, SCL);
+    lcd.init(); 
+    lcd.backlight();
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Initializing...");
+    
+    // --- Buzzer Setup ---
+    ledcAttach(BUZZER_PIN, 1000, buzzerResol);
+    ledcWrite(buzzerChannel, 0);
 
-  lcd.init();
-  lcd.backlight();
+    // --- Calibration ---
+    Serial.println("Calibrating ambient noise...");
+    lcd.setCursor(0, 1);
+    lcd.print("Calibrating...");
+    
+    baseline = calibration();
+    
+    Serial.print("Calibration complete. Baseline = "); 
+    Serial.println(baseline);
 
-  ledcAttach(buzzerChannel, 1000, buzzerResol);
-  ledcWrite(buzzerChannel, 0);
+    // --- Mutex Creation ---
+    volumeMutex = xSemaphoreCreateMutex();
+    if(volumeMutex == NULL){
+        Serial.println("ERROR: Failed to create mutex!");
+        lcd.clear();
+        lcd.print("Mutex Error!");
+        while(1);  // Halt
+    }
 
-  Serial.println("Calibrating ambient noise, stay quiet...");
-  int baseline == calibration();
-  Serial.print("Calibration complete. Baseline = ");
-  Serial.println(baseline);
+    // --- Create FreeRTOS Tasks ---
 
-  volumeMutex = xSemaphoreCreateMutex();
-  if (volumeMutex == NULL) {
-    Serial.println("Failed to create mutex!");
-  }
-
-  // ===== Create FreeRTOS tasks =====
+    // core 0 handles all the I/O tasks (sound data collection, LCD display)
     xTaskCreatePinnedToCore(
-        collectSoundDataTask,  // Task function
-        "SoundData",            // Name
-        2048,                   // Stack size
+        collectSoundDataTask,   // Task function
+        "SoundData",            // Task name
+        4096,                   // Stack size
         NULL,                   // Parameters
         2,                      // Priority
         NULL,                   // Task handle
@@ -315,29 +307,45 @@ void setup(){
     );
 
     xTaskCreatePinnedToCore(
-        playMusicTask,
-        "PlayMusic",
-        4096,
-        NULL,
-        2,
-        NULL,
-        1                       // Core 1
+        displayOnLCDTask,       // Task function
+        "LCD",                  // Task name
+        4096,                   // Stack size
+        NULL,                   // Parameters
+        1,                      // Priority
+        NULL,                   // Task handle
+        0                       // Core 0
     );
 
+    // core 1 handles music playback
+    // this task is CPU intensive due to frequent frequency changes
+    // and also it needs to be smooth for music quality
     xTaskCreatePinnedToCore(
-        displayOnLCDTask,
-        "LCD",
-        2048,
-        NULL,
-        1,
-        NULL,
+        playMusicTask,          // Task function
+        "PlayMusic",            // Task name
+        4096,                   // Stack size
+        NULL,                   // Parameters
+        2,                      // Priority
+        NULL,                   // Task handle
         1                       // Core 1
     );
 
-    // TODO: music change task
 
+    // TODO: Initialize change songs
+    // - only allow change when user is authenticated
+    // xTaskCreatePinnedToCore(
+    //     changeSongTask,       // Task function
+    //     "ChangeSong",                  // Task name
+    //     4096,                   // Stack size
+    //     NULL,                   // Parameters
+    //     1,                      // Priority
+    //     NULL,                   // Task handle
+    //     1                       // Core 1
+    // );
+    
+    Serial.println("=== System Initialized ===");
 }
 
-void loop() {
-    // nothing needed, tasks run independently
+void loop(){
+    // All work is done by FreeRTOS tasks
+    // vTaskDelay(pdMS_TO_TICKS(1000));
 }
