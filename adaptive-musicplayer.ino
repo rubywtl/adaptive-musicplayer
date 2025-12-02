@@ -6,9 +6,18 @@
 // ==================================================================
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+#include <Arduino.h>
+#include <IRrecv.h>
+#include <IRremoteESP8266.h>
+#include <IRutils.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+
+#include "songs.h"  // Song definitions
+
+#include "songs.h"  // Song definitions
 
 // ==================================================================
 // MACROS
@@ -17,6 +26,15 @@
 #define SOUND_SENSOR 1
 #define SDA 8
 #define SCL 9
+#define IR_PIN 18
+
+// Remote codes
+#define CODE_UP    0xFF18E7
+#define CODE_DOWN  0xFF4AB5
+#define CODE_LEFT  0xFF10EF
+#define CODE_RIGHT 0xFF5AA5
+#define CODE_STAR  0xFF6897
+#define CODE_HASH  0xFFB04F
 
 // ==================================================================
 // GLOBAL VARIABLES
@@ -34,8 +52,20 @@ const int SAMPLE_COUNT_BITS = 5;
 const int MIN_DUTY = 50;       
 const int MAX_DUTY = 255;      
 const float PITCH_SCALE = 1.0;
-float currentDuty = MAX_DUTY; // start loud
+float currentDuty = MAX_DUTY;
 const float DUTY_ALPHA = 0.1f;
+
+// -- IR Receiver --
+IRrecv irrecv(IR_PIN);
+decode_results results;
+
+// IR debouncing
+uint32_t lastCode = 0;
+unsigned long lastTime = 0;
+const unsigned long DEBOUNCE_DELAY = 150; // fast but prevents double triggers
+
+QueueHandle_t irQueue;
+enum IrEventType { IR_NEXT, IR_PREV, IR_VOL_UP, IR_VOL_DOWN, IR_MANUAL, IR_AUTO };
 
 // --- Mode ---
 enum Mode { AUTO_MODE, MANUAL_MODE };
@@ -45,35 +75,9 @@ Mode mode = AUTO_MODE;
 volatile int volume = MAX_DUTY;
 SemaphoreHandle_t volumeMutex;
 volatile int currentsong = 0;
-
-// --- Song Data Structure ---
-struct Song {
-    const char* name;
-    int* melody;
-    int* durations;
-    int length;
-};
-
-// --- Song Arrays ---
-int HBDMelody[] = {264,264,297,264,352,330,264,264,297,264,396,352,264,264,528,440,352,330,297,466,466,440,352,396,352};
-int HBDDurations[] = {250,125,500,500,500,1000,250,125,500,500,500,1000,250,125,500,500,500,500,1000,250,125,500,500,500,1000};
-
-int jingleMelody[] = {330,330,330, 330,330,330, 330,392,262,294,330, 349,349,349,349,349,330,330,330,330,294,294,330,294,392};
-int jingleDurations[] = {250,250,500, 250,250,500, 250,250,250,250,500, 250,250,375,125,500, 250,250,375,125,250,250,250,250,750};
-
-int merryMelody[] = {392,392,440,392,523,494, 392,392,440,392,587,523, 392,392,784,659,523,494,440, 698,698,659,523,587,523};
-int merryDurations[] = {300,300,300,300,300,600, 300,300,300,300,300,600, 300,300,300,300,300,300,600, 300,300,300,300,300,600};
-
-int silentMelody[] = {392,392,440,392,494,466, 392,392,440,392,523,494, 392,392,784,659,523,494,440, 698,698,659,523,587,523};
-int silentDurations[] = {600,600,700,700,700,700, 600,600,700,700,700,700, 600,600,700,700,700,700,900, 700,700,700,700,700,900};
-
-const int TOTAL_SONGS = 4;
-const Song songs[TOTAL_SONGS] = {
-    {"Happy Birthday", HBDMelody, HBDDurations, sizeof(HBDMelody)/sizeof(int)},
-    {"Jingle Bells", jingleMelody, jingleDurations, sizeof(jingleMelody)/sizeof(int)},
-    {"Merry Xmas", merryMelody, merryDurations, sizeof(merryMelody)/sizeof(int)},
-    {"Silent Night", silentMelody, silentDurations, sizeof(silentMelody)/sizeof(int)}
-};
+SemaphoreHandle_t songMutex; 
+volatile bool songChanged = false;
+SemaphoreHandle_t songChangeMutex;
 
 // --- LCD Object ---
 LiquidCrystal_I2C lcd(0x27, 16, 2);
@@ -90,6 +94,8 @@ int calibration();
 void collectSoundDataTask(void *pvParameters);
 void playMusicTask(void *pvParameters);
 void displayOnLCDTask(void *pvParameters);
+void IRDecodeTask(void *pvParameters);
+void IRHandlerTask(void *pvParameters);
 
 // ==================================================================
 // FUNCTION IMPLEMENTATIONS
@@ -108,18 +114,37 @@ void changeVolumeHelper(int new_volume){
 
 // --- Song Navigation ---
 void nextSongHelper(){
-    currentsong++;
-    if(currentsong >= TOTAL_SONGS) currentsong = 0;
-    Serial.print(">> Next Song: "); 
-    Serial.println(songs[currentsong].name);
+    if(xSemaphoreTake(songMutex, portMAX_DELAY) == pdTRUE){
+        currentsong++;
+        if(currentsong >= TOTAL_SONGS) currentsong = 0;
+        Serial.print(">> Next Song: "); 
+        Serial.println(songs[currentsong].name);
+        xSemaphoreGive(songMutex);
+    }
+
+    // mark song change
+    if(xSemaphoreTake(songChangeMutex, 0) == pdTRUE){
+        songChanged = true;
+        xSemaphoreGive(songChangeMutex);
+    }
 }
 
 void prevSongHelper(){
-    currentsong--;
-    if(currentsong < 0) currentsong = TOTAL_SONGS - 1;
-    Serial.print("<< Prev Song: "); 
-    Serial.println(songs[currentsong].name);
+    if(xSemaphoreTake(songMutex, portMAX_DELAY) == pdTRUE){
+        currentsong--;
+        if(currentsong < 0) currentsong = TOTAL_SONGS - 1;
+        Serial.print("<< Prev Song: "); 
+        Serial.println(songs[currentsong].name);
+        xSemaphoreGive(songMutex);
+    }
+
+    // mark song change
+    if(xSemaphoreTake(songChangeMutex, 0) == pdTRUE){
+        songChanged = true;
+        xSemaphoreGive(songChangeMutex);
+    }
 }
+
 
 // --- Calibration ---
 int calibration(){
@@ -129,13 +154,13 @@ int calibration(){
     
     while(millis() - start < CALIBRATION_TIME){
         int val = 0;
-        for(int i = 0; i < 32; i++){
+        for(int i = 0; i < (1 << SAMPLE_COUNT_BITS); i++){
             val += analogRead(SOUND_SENSOR);
         }
-        val /= 32; 
+        val >>= SAMPLE_COUNT_BITS;  // divide by 32
         sum += val;
         count++;
-        vTaskDelay(pdMS_TO_TICKS(1));
+        delay(10);
     }
     
     baseline = sum / count;
@@ -162,23 +187,21 @@ void collectSoundDataTask(void *pvParameters){
             int soundValue = 0;
             
             // sample sound sensor
-            for(int j = 0; j < 32; j++){
+            for(int j = 0; j < (1 << SAMPLE_COUNT_BITS); j++){
                 soundValue += analogRead(SOUND_SENSOR);
             }
-            soundValue /= 32;  // divide by 32
+            soundValue >>= SAMPLE_COUNT_BITS;  // divide by 32
 
             // map to duty cycle range
-            // - instead of setting duty cycles directly, use smoothing
-            // - this makes volume changes less abrupt
-            int targetDuty = map(soundValue, baseline, 1023, MIN_DUTY, MAX_DUTY);
+            int targetDuty = map(soundValue, baseline, 4095, MIN_DUTY, MAX_DUTY);
             targetDuty = constrain(targetDuty, MIN_DUTY, MAX_DUTY);
             
             // smooth transition: currentDuty chases targetDuty
             currentDuty = currentDuty + DUTY_ALPHA * (targetDuty - currentDuty);
             
-            Serial.print(" Sound: "); Serial.print(soundValue);
-            Serial.print("  Duty: "); Serial.println(targetDuty);
-
+            // Format for serial plotter: label:value
+            // Serial.print("CurrentDuty:");
+            // Serial.println((int)currentDuty);
             
             // Update volume
             changeVolumeHelper((int)currentDuty);
@@ -189,56 +212,88 @@ void collectSoundDataTask(void *pvParameters){
 
 // --- Task: Play Music ---
 void playMusicTask(void *pvParameters){
-    printf("play music task\n");
+    Serial.println("[PlayMusic] Task started");
+    bool changed = false;
 
     while(1){
-        Song song = songs[currentsong];
+        // Get current song safely
+        int songIndex;
+        if(xSemaphoreTake(songMutex, portMAX_DELAY) == pdTRUE){
+            songIndex = currentsong;
+            xSemaphoreGive(songMutex);
+        }
         
-        Serial.print("Playing: ");
+        Song song = songs[songIndex];
+        
+        Serial.print("[PlayMusic] Playing: ");
         Serial.println(song.name);
         
         // play each note in the song
         for(int i = 0; i < song.length; i++){
+
+            // --- check for song change before playing note ---
+            changed = false;
+            if(xSemaphoreTake(songChangeMutex, 0) == pdTRUE){
+                changed = songChanged;
+                if(changed) songChanged = false; // reset flag
+                xSemaphoreGive(songChangeMutex);
+            }
+
+            if(changed){
+                Serial.println("[PlayMusic] Song change detected! Switching immediately.");
+                break;  // exit note loop, reload new song
+            }
+
             int freq = (int)(song.melody[i] * PITCH_SCALE);
             int dur = song.durations[i];
-            
-            // play note for its duration
+
             unsigned long start = millis();
             while(millis() - start < dur){
-                // read volume safely
                 int vol;
                 if(xSemaphoreTake(volumeMutex, portMAX_DELAY) == pdTRUE){
                     vol = volume;
                     xSemaphoreGive(volumeMutex);
                 }
-                
-                // set frequency and volume
-                ledcWrite(buzzerChannel, vol);
+
                 ledcChangeFrequency(buzzerChannel, freq, buzzerResol);
+                ledcWrite(buzzerChannel, vol);
 
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
-            
-            // silence between notes
+
             ledcWrite(buzzerChannel, 0);
             vTaskDelay(pdMS_TO_TICKS(30));
         }
+
         
-        // pause before repeating song
+        // Song finished - move to next song automatically
+        if(!changed){
+            Serial.println("[PlayMusic] Song complete, moving to next...");
+            nextSongHelper();
+        }
+        
+        // pause before starting next song
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
 // --- Task: Display on LCD ---
 void displayOnLCDTask(void *pvParameters){
-    printf("display task\n");
+    Serial.println("[LCD] Task started");
 
     while(1){
         lcd.clear();
         
+        // Get current song safely
+        int songIndex;
+        if(xSemaphoreTake(songMutex, portMAX_DELAY) == pdTRUE){
+            songIndex = currentsong;
+            xSemaphoreGive(songMutex);
+        }
+        
         // Line 1: Song name
         lcd.setCursor(0, 0);
-        lcd.print(songs[currentsong].name);
+        lcd.print(songs[songIndex].name);
 
         // Line 2: Volume and mode
         lcd.setCursor(0, 1);
@@ -258,6 +313,141 @@ void displayOnLCDTask(void *pvParameters){
     }
 }
 
+// --- Task: IR Decode ---
+void IRDecodeTask(void *pvParameters){
+    Serial.println("[IR] Task started");
+    Serial.println("[IR] Waiting for IR signals...");
+    
+    int loopCount = 0;
+    
+    while(1){
+        
+        if (irrecv.decode(&results)) {
+            Serial.println("[IR] Signal received!");
+            
+            uint32_t value = results.value;
+            
+            // Handle repeat code
+            if (value == 0xFFFFFFFF) {
+                value = lastCode;  // repeat last command
+            } else {
+                lastCode = value;  // store new command
+            }
+            
+            unsigned long currentTime = millis();
+            
+            // check debounce
+            if (currentTime - lastTime > DEBOUNCE_DELAY) {
+                lastTime = currentTime;
+                
+                Serial.print("[IR] Received code: 0x");
+                Serial.print(value, HEX);
+                Serial.print(" -> ");
+
+                IrEventType event;
+                switch (value) {
+                    case CODE_UP:
+                        Serial.println("EVENT: Volume Up");
+                        event = IR_VOL_UP;
+                        xQueueSend(irQueue, &event, 0);
+                        break;
+
+                    case CODE_DOWN:
+                        Serial.println("EVENT: Volume Down");
+                        event = IR_VOL_DOWN;
+                        xQueueSend(irQueue, &event, 0);
+                        break;
+
+                    case CODE_LEFT:
+                        Serial.println("EVENT: Previous Song");
+                        event = IR_PREV;
+                        xQueueSend(irQueue, &event, 0);
+                        break;
+
+                    case CODE_RIGHT:
+                        Serial.println("EVENT: Next Song");
+                        event = IR_NEXT;
+                        xQueueSend(irQueue, &event, 0);
+                        break;
+
+                    case CODE_HASH:
+                        Serial.println("EVENT: Manual Mode (#)");
+                        event = IR_MANUAL;
+                        xQueueSend(irQueue, &event, 0);
+                        break;
+
+                    case CODE_STAR:
+                        Serial.println("EVENT: Auto Mode (*)");
+                        event = IR_AUTO;
+                        xQueueSend(irQueue, &event, 0);
+                        break;
+
+                    default:
+                        Serial.println("Unknown button");
+                        break;
+                }
+            } else {
+                Serial.println("[IR] Signal ignored (debounce)");
+            }
+
+            irrecv.resume(); // receive the next value
+        }
+        vTaskDelay(pdMS_TO_TICKS(10)); // very short delay - checks IR every 10ms
+    }
+}
+
+void IRHandlerTask(void *pvParameters){
+    Serial.println("[IR Handler] Task started");
+
+    IrEventType event;
+
+    while (1){
+        if (xQueueReceive(irQueue, &event, portMAX_DELAY) == pdTRUE){
+
+            switch(event){
+
+                case IR_VOL_UP:
+                    // only allow volume up in MANUAL mode  
+                    if (mode == MANUAL_MODE) {
+                        changeVolumeHelper(volume + 5);
+                    } else {
+                        Serial.println("[IR Handler] Ignored: Volume UP disabled in AUTO mode");
+                    }
+                    break;
+
+                case IR_VOL_DOWN:
+                    if (mode == MANUAL_MODE) {
+                        changeVolumeHelper(volume - 5);
+                    } else {
+                        Serial.println("[IR Handler] Ignored: Volume DOWN disabled in AUTO mode");
+                    }
+                    break;
+
+                case IR_NEXT:
+                    nextSongHelper();
+                    break;
+
+                case IR_PREV:
+                    prevSongHelper();
+                    break;
+
+                case IR_MANUAL:
+                    // directly switch to manual mode
+                    // it's okay to not have a mutex beecause only this task modifies mode
+                    // and other tasks only read it
+                    mode = MANUAL_MODE;
+                    break;
+
+                case IR_AUTO:
+                    mode = AUTO_MODE;
+                    break;
+            }
+        }
+    }
+}
+
+
+
 // ==================================================================
 // SETUP & LOOP
 // ==================================================================
@@ -276,9 +466,21 @@ void setup(){
     lcd.print("Initializing...");
     
     // --- Buzzer Setup ---
-    ledcSetup(buzzerChannel, 1000, buzzerResol);
     ledcAttachPin(BUZZER_PIN, buzzerChannel);
     ledcWrite(buzzerChannel, 0);
+    
+    // --- IR Receiver Setup ---
+    irrecv.enableIRIn();
+    Serial.println("IR Receiver enabled");
+
+    // --- IR Event Queue ---
+    irQueue = xQueueCreate(10, sizeof(IrEventType));
+    if (irQueue == NULL) {
+        Serial.println("ERROR: Failed to create IR queue!");
+        lcd.clear();
+        lcd.print("Queue Error!");
+        while(1);
+    }
 
     // --- Calibration ---
     Serial.println("Calibrating ambient noise...");
@@ -292,7 +494,10 @@ void setup(){
 
     // --- Mutex Creation ---
     volumeMutex = xSemaphoreCreateMutex();
-    if(volumeMutex == NULL){
+    songMutex = xSemaphoreCreateMutex();
+    songChangeMutex = xSemaphoreCreateMutex();
+    
+    if(volumeMutex == NULL || songMutex == NULL || songChangeMutex == NULL){
         Serial.println("ERROR: Failed to create mutex!");
         lcd.clear();
         lcd.print("Mutex Error!");
@@ -322,9 +527,28 @@ void setup(){
         0                       // Core 0
     );
 
+    // IR decode task on core 0
+    xTaskCreatePinnedToCore(
+        IRDecodeTask,           // Task function
+        "IR_Decode",            // Task name
+        4096,                   // Stack size
+        NULL,                   // Parameters
+        1,                      // Priority
+        NULL,                   // Task handle
+        0                       // Core 0
+    );
+
+    xTaskCreatePinnedToCore(
+        IRHandlerTask,
+        "IR_Handler",
+        4096,
+        NULL,
+        2,     // higher priority than decode
+        NULL,
+        0
+    );
+
     // core 1 handles music playback
-    // this task is CPU intensive due to frequent frequency changes
-    // and also it needs to be smooth for music quality
     xTaskCreatePinnedToCore(
         playMusicTask,          // Task function
         "PlayMusic",            // Task name
@@ -340,5 +564,5 @@ void setup(){
 
 void loop(){
     // All work is done by FreeRTOS tasks
-    // vTaskDelay(pdMS_TO_TICKS(1000));
+    vTaskDelay(pdMS_TO_TICKS(1000));
 }
