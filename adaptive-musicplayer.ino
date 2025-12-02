@@ -10,12 +10,11 @@
 #include <IRrecv.h>
 #include <IRremoteESP8266.h>
 #include <IRutils.h>
+#include <MFRC522.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
-
-#include "songs.h"  // Song definitions
 
 #include "songs.h"  // Song definitions
 
@@ -27,6 +26,9 @@
 #define SDA 8
 #define SCL 9
 #define IR_PIN 18
+
+#define SS_PIN   10      
+#define RST_PIN   3      
 
 // Remote codes
 #define CODE_UP    0xFF18E7
@@ -49,8 +51,8 @@ int baseline = 0;
 const int CALIBRATION_TIME = 3000; 
 const int SAMPLE_COUNT_BITS = 5;  
 
-const int MIN_DUTY = 50;       
-const int MAX_DUTY = 255;      
+const int MIN_DUTY = 0;       
+const int MAX_DUTY = 5;      
 const float PITCH_SCALE = 1.0;
 float currentDuty = MAX_DUTY;
 const float DUTY_ALPHA = 0.1f;
@@ -82,6 +84,16 @@ SemaphoreHandle_t songChangeMutex;
 // --- LCD Object ---
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
+// --- RFID Authentication State ---
+unsigned long authExpiration = 0;
+volatile bool authActive = false;
+
+byte GOOD_UID[] = {0x84, 0x1E, 0xB0, 0x02};
+const byte GOOD_UID_SIZE = 4;
+
+// --- RFID Object --
+MFRC522 rfid(SS_PIN, RST_PIN);
+
 // ==================================================================
 // FUNCTION DECLARATIONS
 // ==================================================================
@@ -89,6 +101,8 @@ void changeVolumeHelper(int new_volume);
 void nextSongHelper();
 void prevSongHelper();
 int calibration();
+bool uidMatch();
+
 
 // Task Declarations
 void collectSoundDataTask(void *pvParameters);
@@ -165,11 +179,21 @@ int calibration(){
     
     baseline = sum / count;
     
-    // sanity check
-    if(baseline >= 4000) baseline = 2000;
-    if(baseline <= 10) baseline = 100; 
+    // // sanity check
+    // if(baseline >= 4000) baseline = 2000;
+    // if(baseline <= 10) baseline = 100; 
     
     return baseline;
+}
+
+// --- Authentication---
+bool uidMatch(const byte* uid, byte uidSize){
+  if(uidSize != GOOD_UID_SIZE) return false;
+
+  for(byte i = 0; i < GOOD_UID_SIZE; i++){
+    if(uid[i] != GOOD_UID[i]) return false;
+  }
+    return true;
 }
 
 
@@ -193,7 +217,7 @@ void collectSoundDataTask(void *pvParameters){
             soundValue >>= SAMPLE_COUNT_BITS;  // divide by 32
 
             // map to duty cycle range
-            int targetDuty = map(soundValue, baseline, 4095, MIN_DUTY, MAX_DUTY);
+            int targetDuty = map(soundValue, baseline, 3000, MAX_DUTY, MIN_DUTY);
             targetDuty = constrain(targetDuty, MIN_DUTY, MAX_DUTY);
             
             // smooth transition: currentDuty chases targetDuty
@@ -295,9 +319,9 @@ void displayOnLCDTask(void *pvParameters){
         lcd.setCursor(0, 0);
         lcd.print(songs[songIndex].name);
 
-        // Line 2: Volume and mode
+        // Line 2: Volume, mode, and auth timer
         lcd.setCursor(0, 1);
-        lcd.print("Vol:");
+        lcd.print("V:");
         
         int currentVol;
         if(xSemaphoreTake(volumeMutex, portMAX_DELAY) == pdTRUE){
@@ -305,9 +329,24 @@ void displayOnLCDTask(void *pvParameters){
             xSemaphoreGive(volumeMutex);
         }
         lcd.print(currentVol);
+        lcd.print(" ");
 
-        lcd.setCursor(10, 1);
-        lcd.print(mode == AUTO_MODE ? "AUTO" : "MANUAL");
+        // Mode: A = AUTO | M = MANUAL
+        lcd.print(mode == AUTO_MODE ? "Auto" : "Manual");
+        lcd.print(" ");
+
+        if(authActive){
+            long remaining = (long)(authExpiration - millis());
+            if (remaining < 0) remaining = 0;
+            int sec = remaining / 1000;
+
+            //lcd.print("T");
+            lcd.print(sec);
+            lcd.print("s");
+        } else {
+            // clear leftover chars if authinactive
+            lcd.print(" x ");
+        }
 
         vTaskDelay(pdMS_TO_TICKS(500));
     }
@@ -404,12 +443,18 @@ void IRHandlerTask(void *pvParameters){
     while (1){
         if (xQueueReceive(irQueue, &event, portMAX_DELAY) == pdTRUE){
 
+            // if not authenticated - ignore everything
+            if (!authActive) {
+                Serial.println("[IR Handler] Ignored: not authenticated");
+                continue;
+            }
+
             switch(event){
 
                 case IR_VOL_UP:
                     // only allow volume up in MANUAL mode  
                     if (mode == MANUAL_MODE) {
-                        changeVolumeHelper(volume + 5);
+                        changeVolumeHelper(volume + 1);
                     } else {
                         Serial.println("[IR Handler] Ignored: Volume UP disabled in AUTO mode");
                     }
@@ -417,7 +462,7 @@ void IRHandlerTask(void *pvParameters){
 
                 case IR_VOL_DOWN:
                     if (mode == MANUAL_MODE) {
-                        changeVolumeHelper(volume - 5);
+                        changeVolumeHelper(volume - 1);
                     } else {
                         Serial.println("[IR Handler] Ignored: Volume DOWN disabled in AUTO mode");
                     }
@@ -443,6 +488,37 @@ void IRHandlerTask(void *pvParameters){
                     break;
             }
         }
+    }
+}
+
+// --- Task: RFID Authentication ---
+void RFIDTask(void *pvParameters) {
+    Serial.println("[RFID] Task started");
+
+    while(1){
+        if(authActive){
+            long remaining = (long)(authExpiration - millis());
+            // Handles Timeout
+            if(remaining <= 0) {
+                authActive = false;
+                Serial.println("[RFID] Auth expired - returning to AUTO mode");
+            }
+        }
+
+        if(rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()){
+            if(uidMatch(rfid.uid.uidByte, rfid.uid.size)){
+                Serial.println("[RFID] Authenticated card");
+
+                authActive = true;
+                authExpiration = millis() + 30000; 
+            } else {
+                Serial.println("[RFID] Not Authenticated");
+            }
+
+                rfid.PICC_HaltA();
+                rfid.PCD_StopCrypto1();
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -481,6 +557,10 @@ void setup(){
         lcd.print("Queue Error!");
         while(1);
     }
+
+    // --- RFID Setup ---
+    SPI.begin(36, 37, 35, SS_PIN);  // SCK  MISO MOSI
+    rfid.PCD_Init();
 
     // --- Calibration ---
     Serial.println("Calibrating ambient noise...");
@@ -544,6 +624,17 @@ void setup(){
         4096,
         NULL,
         2,     // higher priority than decode
+        NULL,
+        0
+    );
+
+    // RFID task on core 0
+     xTaskCreatePinnedToCore(
+        RFIDTask,
+        "RFID",
+        4096,
+        NULL,
+        3,     // higher priority than everything
         NULL,
         0
     );
