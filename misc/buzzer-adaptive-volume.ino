@@ -1,7 +1,8 @@
 #define BUZZER_PIN 5
-int sound_sensor = A1;
+int sound_sensor = 1;
 
 const int buzzerResol = 8;      // 8-bit resolution
+const int buzzerChannel = 0;
 
 // --- Happy Birthday Melody ---
 int songMelody[] = {
@@ -36,8 +37,10 @@ const float DUTY_ALPHA = 0.1f;
 
 void setup() {
   Serial.begin(115200);
-  ledcAttach(BUZZER_PIN, 1000, buzzerResol);
-  ledcWrite(BUZZER_PIN, 0);
+  int val = ledcSetup(buzzerChannel, 1000, buzzerResol);
+  printf("Setup Val: %d\n", val);
+  ledcAttachPin(BUZZER_PIN, buzzerChannel);
+  ledcWrite(buzzerChannel, 0);
 
   // --- Calibrate ambient noise ---
   Serial.println("Calibrating ambient noise, stay quiet...");
@@ -83,11 +86,13 @@ void playMusic() {
       // big alpha (very sensitive)
       currentDuty = currentDuty + DUTY_ALPHA * (targetDuty - currentDuty);
       int dutyToWrite = (int)currentDuty;
+      
+      ledcWrite(buzzerChannel, dutyToWrite);
+      int ret = ledcChangeFrequency(buzzerChannel, freq, buzzerResol);
 
-      ledcWrite(BUZZER_PIN, dutyToWrite);
-      ledcChangeFrequency(BUZZER_PIN, freq, buzzerResol);
+      // printf("freq given: %d, returned freq %d\n", freq, ret);
 
-      // --- Print values for Serial Plotter ---
+      --- Print values for Serial Plotter ---
       Serial.print("Min:0 Max:1023 "); // keep min/max for plotter
       Serial.print("Sound:");
       Serial.print(soundValue);

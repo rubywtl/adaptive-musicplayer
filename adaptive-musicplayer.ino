@@ -1,3 +1,6 @@
+// Adaptive Music Player
+// author: Ruby Lee, Feier Long, 2025
+
 // ==================================================================
 // INCLUDES
 // ==================================================================
@@ -26,11 +29,12 @@ const int buzzerResol = 8;
 // --- Calibration & Volume Mapping ---
 int baseline = 0;               
 const int CALIBRATION_TIME = 3000; 
-const int SAMPLE_COUNT = 32;       
+const int SAMPLE_COUNT_BITS = 5;  
+
 const int MIN_DUTY = 50;       
 const int MAX_DUTY = 255;      
 const float PITCH_SCALE = 1.0;
-float currentDuty = MAX_DUTY;
+float currentDuty = MAX_DUTY; // start loud
 const float DUTY_ALPHA = 0.1f;
 
 // --- Mode ---
@@ -125,13 +129,13 @@ int calibration(){
     
     while(millis() - start < CALIBRATION_TIME){
         int val = 0;
-        for(int i = 0; i < SAMPLE_COUNT; i++){
+        for(int i = 0; i < 32; i++){
             val += analogRead(SOUND_SENSOR);
         }
-        val /= SAMPLE_COUNT; 
+        val /= 32; 
         sum += val;
         count++;
-        delay(10);
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
     
     baseline = sum / count;
@@ -158,22 +162,23 @@ void collectSoundDataTask(void *pvParameters){
             int soundValue = 0;
             
             // sample sound sensor
-            for(int j = 0; j < SAMPLE_COUNT; j++){
+            for(int j = 0; j < 32; j++){
                 soundValue += analogRead(SOUND_SENSOR);
             }
-            soundValue >>= 5;  // divide by 32
+            soundValue /= 32;  // divide by 32
 
             // map to duty cycle range
             // - instead of setting duty cycles directly, use smoothing
             // - this makes volume changes less abrupt
-            int targetDuty = map(soundValue, baseline, 4095, MIN_DUTY, MAX_DUTY);
+            int targetDuty = map(soundValue, baseline, 1023, MIN_DUTY, MAX_DUTY);
             targetDuty = constrain(targetDuty, MIN_DUTY, MAX_DUTY);
             
             // smooth transition: currentDuty chases targetDuty
             currentDuty = currentDuty + DUTY_ALPHA * (targetDuty - currentDuty);
             
-            Serial.print("Current duty: ");
-            Serial.println((int)currentDuty);
+            Serial.print(" Sound: "); Serial.print(soundValue);
+            Serial.print("  Duty: "); Serial.println(targetDuty);
+
             
             // Update volume
             changeVolumeHelper((int)currentDuty);
@@ -208,9 +213,9 @@ void playMusicTask(void *pvParameters){
                 }
                 
                 // set frequency and volume
-                ledcChangeFrequency(buzzerChannel, freq, buzzerResol);
                 ledcWrite(buzzerChannel, vol);
-                
+                ledcChangeFrequency(buzzerChannel, freq, buzzerResol);
+
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
             
@@ -271,7 +276,8 @@ void setup(){
     lcd.print("Initializing...");
     
     // --- Buzzer Setup ---
-    ledcAttach(BUZZER_PIN, 1000, buzzerResol);
+    ledcSetup(buzzerChannel, 1000, buzzerResol);
+    ledcAttachPin(BUZZER_PIN, buzzerChannel);
     ledcWrite(buzzerChannel, 0);
 
     // --- Calibration ---
@@ -328,19 +334,6 @@ void setup(){
         NULL,                   // Task handle
         1                       // Core 1
     );
-
-
-    // TODO: Initialize change songs
-    // - only allow change when user is authenticated
-    // xTaskCreatePinnedToCore(
-    //     changeSongTask,       // Task function
-    //     "ChangeSong",                  // Task name
-    //     4096,                   // Stack size
-    //     NULL,                   // Parameters
-    //     1,                      // Priority
-    //     NULL,                   // Task handle
-    //     1                       // Core 1
-    // );
     
     Serial.println("=== System Initialized ===");
 }
