@@ -47,7 +47,8 @@ const int buzzerChannel = 0;
 const int buzzerResol = 8;
 
 // --- Calibration & Volume Mapping ---
-int baseline = 0;               
+int baseline = 0;     
+int loudLevel = 3000;          
 const int CALIBRATION_TIME = 3000; 
 const int SAMPLE_COUNT_BITS = 5;  
 
@@ -100,7 +101,7 @@ MFRC522 rfid(SS_PIN, RST_PIN);
 void changeVolumeHelper(int new_volume);
 void nextSongHelper();
 void prevSongHelper();
-int calibration();
+void calibration();
 bool uidMatch();
 
 
@@ -161,29 +162,69 @@ void prevSongHelper(){
 
 
 // --- Calibration ---
-int calibration(){
-    long sum = 0;
+void calibration(){
+    int quietSum = 0;
+    int loudSum = 0;
     int count = 0;
-    unsigned long start = millis();
     
+    // Phase 1: Capture quiet baseline
+    Serial.println("Phase 1: Stay QUIET for 3 seconds...");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Stay QUIET!");
+    lcd.setCursor(0, 1);
+    lcd.print("Calibrating...");
+    
+    unsigned long start = millis();
     while(millis() - start < CALIBRATION_TIME){
         int val = 0;
         for(int i = 0; i < (1 << SAMPLE_COUNT_BITS); i++){
             val += analogRead(SOUND_SENSOR);
         }
-        val >>= SAMPLE_COUNT_BITS;  // divide by 32
-        sum += val;
+        val >>= SAMPLE_COUNT_BITS;
+        quietSum += val;
         count++;
         delay(10);
     }
     
-    baseline = sum / count;
+    int quietBaseline = quietSum / count;
     
-    // // sanity check
-    // if(baseline >= 4000) baseline = 2000;
-    // if(baseline <= 10) baseline = 100; 
+    // Phase 2: Capture loud talking
+    Serial.println("Phase 2: TALK LOUDLY close to sensor for 3 seconds...");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("TALK LOUDLY!");
+    lcd.setCursor(0, 1);
+    lcd.print("Near sensor...");
     
-    return baseline;
+    count = 0;
+    start = millis();
+    while(millis() - start < CALIBRATION_TIME){
+        int val = 0;
+        for(int i = 0; i < (1 << SAMPLE_COUNT_BITS); i++){
+            val += analogRead(SOUND_SENSOR);
+        }
+        val >>= SAMPLE_COUNT_BITS;
+        loudSum += val;
+        count++;
+        delay(10);
+    }
+    
+    int loudBaseline = loudSum / count;
+    
+    // Store values
+    baseline = quietBaseline;
+    
+    // add some margin to the loud level for headroom
+    if(loudBaseline > 3900){
+        loudLevel = min(4095, 3500); // cap if it is not loud enough
+    }
+    loudLevel = min(4095, loudBaseline + 50);
+    
+    Serial.print("Calibration complete. Quiet = ");
+    Serial.print(baseline);
+    Serial.print(", Loud = ");
+    Serial.println(loudLevel);
 }
 
 // --- Authentication---
@@ -217,7 +258,7 @@ void collectSoundDataTask(void *pvParameters){
             soundValue >>= SAMPLE_COUNT_BITS;  // divide by 32
 
             // map to duty cycle range
-            int targetDuty = map(soundValue, baseline, 3000, MAX_DUTY, MIN_DUTY);
+            int targetDuty = map(soundValue, baseline, loudLevel, MAX_DUTY, MIN_DUTY);
             targetDuty = constrain(targetDuty, MIN_DUTY, MAX_DUTY);
             
             // smooth transition: currentDuty chases targetDuty
@@ -566,11 +607,9 @@ void setup(){
     Serial.println("Calibrating ambient noise...");
     lcd.setCursor(0, 1);
     lcd.print("Calibrating...");
+    calibration();
     
-    baseline = calibration();
-    
-    Serial.print("Calibration complete. Baseline = "); 
-    Serial.println(baseline);
+    Serial.print("Calibration complete. "); 
 
     // --- Mutex Creation ---
     volumeMutex = xSemaphoreCreateMutex();
@@ -655,5 +694,5 @@ void setup(){
 
 void loop(){
     // All work is done by FreeRTOS tasks
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    // vTaskDelay(pdMS_TO_TICKS(1000));
 }
